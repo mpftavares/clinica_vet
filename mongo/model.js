@@ -44,6 +44,24 @@
 // Não são required os campos que aceitavam NULL nem as relações que podiam
 // ter zero elementos.
 // Os campos sem valor são omitidos (em vez de NULL como em SQL).
+//
+// Alternativa NoSQL (não implementada): as observações registadas pelos
+// colaboradores ficam embedded no episódio, porque são poucas por episódio.
+// Se a clínica passasse a recolher os sinais vitais diretamente dos monitores
+// durante o internamento (temperatura, frequência cardíaca, frequência
+// respiratória a cada poucos segundos), esses dados seriam mais adequados a
+// uma base de dados time-series:
+//   - grande volume e escrita contínua (append-only), sem alterações nem
+//     eliminações;
+//   - consultas sempre por intervalo de tempo (ex.: média da temperatura de
+//     5 em 5 minutos na última hora);
+//   - compressão dos timestamps e políticas de retenção (ex.: guardar os
+//     valores brutos durante 7 dias e as médias durante 1 ano).
+// Embedded no episódio, estas medições fariam crescer o documento sem limite.
+// O MongoDB também suporta time-series collections, que serviriam para um
+// volume moderado; uma base de dados time-series dedicada (InfluxDB, TimescaleDB) 
+// justifica-se pelas agregações contínuas e pela retenção por níveis 
+// (valores brutos -> médias), que o MongoDB não faz.
 
 db = db.getSiblingDB('clinica_vet');
 
