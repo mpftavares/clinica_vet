@@ -19,6 +19,10 @@
 #   2. psql       corre data_export.sql e grava episodios.json, com um
 #                 documento JSON por episódio e por linha.
 #   3. mongoimport importa episodios.json para a coleção episodios.
+#   4. testes     corre mongo/tests/consistency.sql (PostgreSQL) e
+#                 mongo/tests/consistency.js (MongoDB), que fazem as mesmas
+#                 contagens, e compara-as linha a linha; termina com erro se
+#                 algum teste tiver valores diferentes.
 #
 # Ligações (alterar aqui se necessário):
 #   PGDATABASE    base de dados PostgreSQL (o psql usa também PGHOST, PGPORT,
@@ -36,17 +40,40 @@ set -e
 # executado.
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "1/3 Criar a coleção episodios (mongo/model.js)"
+echo "1/4 Criar a coleção episodios (mongo/model.js)"
 mongosh "$MONGO_URI" --quiet --file "$DIR/../model.js"
 
-echo "2/3 Exportar o PostgreSQL para episodios.json (data_export.sql)"
+echo "2/4 Exportar o PostgreSQL para episodios.json (data_export.sql)"
 # ON_ERROR_STOP=1: o psql termina com erro se alguma instrução SQL falhar.
 psql -q -At -v ON_ERROR_STOP=1 -d "$PGDATABASE" \
      -f "$DIR/data_export.sql" -o "$DIR/episodios.json"
 echo "    $(wc -l < "$DIR/episodios.json" | tr -d ' ') documentos exportados"
 
-echo "3/3 Importar episodios.json para o MongoDB (mongoimport)"
+echo "3/4 Importar episodios.json para o MongoDB (mongoimport)"
 mongoimport --uri "$MONGO_URI/clinica_vet" --collection episodios \
             --file "$DIR/episodios.json"
+
+echo "4/4 Testes de consistência (mongo/tests/consistency.sql e .js)"
+# Os resultados vão para ficheiros temporários (mktemp), apagados no fim.
+PG_TXT="$(mktemp)"
+MONGO_TXT="$(mktemp)"
+trap 'rm -f "$PG_TXT" "$MONGO_TXT"' EXIT
+psql -q -At -v ON_ERROR_STOP=1 -d "$PGDATABASE" \
+     -f "$DIR/../tests/consistency.sql" -o "$PG_TXT"
+mongosh "$MONGO_URI" --quiet --file "$DIR/../tests/consistency.js" > "$MONGO_TXT"
+
+# Junta as duas listas lado a lado (paste) e compara os valores de cada
+# teste (awk); ambas têm uma linha "teste|valor" por teste, pela mesma ordem.
+paste -d'|' "$PG_TXT" "$MONGO_TXT" | awk -F'|' '
+  BEGIN { printf "    %-28s %12s %12s\n", "teste", "PostgreSQL", "MongoDB" }
+  {
+    estado = ($1 == $3 && $2 == $4) ? "OK" : "FALHA"
+    if (estado == "FALHA") falhas++
+    printf "    %-28s %12s %12s  %s\n", $1, $2, $4, estado
+  }
+  END {
+    if (falhas > 0) { print "    " falhas " teste(s) com valores diferentes."; exit 1 }
+    print "    Todos os testes iguais (" NR ")."
+  }'
 
 echo "Migração concluída."
