@@ -1,3 +1,5 @@
+// 1. ANÁLISE
+// -----------------------------------------------------------------------------
 // Passa para MongoDB o EPISÓDIO CLÍNICO.
 //
 // Ficam no PostgreSQL:
@@ -12,45 +14,95 @@
 //   - análise
 //   - marcação
 //
-// Coleção "episodios" — um documento por episódio clínico. Um episódio é
-// lido como um todo (histórico clínico, Q11). Ficam EMBEDDED os dados
-// que só existem dentro do episódio:
-//   - internamento
-//   - observações
-//   - atos clínicos e, dentro de cada ato, os seus anexos
-//   - pedidos laboratoriais -> análises pedidas (linha_pedido) -> resultado
+// Porque o episódio clínico:
+//   - É lido como um todo. O histórico clínico de um animal (Q11) e a
+//     consulta de um episódio juntam, em SQL, 8 tabelas (episodio,
+//     internamento, observacao, ato_clinico, anexo, pedido_laboratorial,
+//     linha_pedido, resultado). Num documento, o episódio lê-se numa única
+//     operação, sem JOINs.
+//   - A estrutura varia de episódio para episódio. Uma consulta simples tem
+//     um ato e uma observação; um internamento tem dezenas de observações,
+//     atos com anexos e pedidos com várias análises. Nas observações só se
+//     preenchem os sinais medidos (em SQL ficam colunas a NULL) e as análises
+//     pendentes não têm resultado. O esquema flexível guarda apenas o que
+//     existe.
+//   - Cresce de forma limitada. Um episódio tem poucas observações, atos e
+//     pedidos e, depois de fechado, deixa de mudar.
+//   - Os seus elementos não existem fora dele. Uma observação, um ato, um
+//     anexo, um pedido ou um resultado pertencem sempre a um só episódio e
+//     são criados e eliminados com ele.
 //
-// As 8 tabelas do registo clínico do PostgreSQL (episodio, internamento,
-// observacao, ato_clinico, anexo, pedido_laboratorial, linha_pedido,
-// resultado) passam a uma única coleção.
+// Porque o resto permanece no PostgreSQL:
+//   - São dados partilhados por muitos episódios (o mesmo animal, o
+//     mesmo colaborador, o mesmo serviço): existem antes e depois de qualquer
+//     episódio e são alterados independentemente.
+//   - Dependem de integridade referencial e de regras que consultam outras
+//     linhas, verificadas pelo próprio PostgreSQL: chaves estrangeiras (uma
+//     marcação só pode referir um animal que existe) e os triggers das
+//     marcações (só colaboradores ativos, sem sobreposição de horários do
+//     mesmo veterinário). O MongoDB não tem chaves estrangeiras e o
+//     $jsonSchema só valida o próprio documento.
+//   - As marcações são escritas concorrentes sobre a mesma agenda: a regra
+//     "sem sobreposição" compara várias linhas e tem de ser verificada e gravada
+//     como um todo, numa transação ACID, para que duas marcações simultâneas
+//     não passem ambas a verificação.
 //
-// Referências para o PostgreSQL: animal, colaborador, serviço e análise
-// são entidades que existem por si só, independentemente do episódio,
-// sendo referenciadas pelo id. Junto ao id guarda-se uma cópia apenas dos
-// atributos usados pelas queries e que não mudam (ou que devem ficar congelados
-// à data do registo):
+// 2. MODELO E CORRESPONDÊNCIA COM O POSTGRESQL
+// -----------------------------------------------------------------------------
+// Coleção "episodios": um documento por episódio clínico. As 8 tabelas do
+// registo clínico passam a uma única coleção:
+//
+//   PostgreSQL            MongoDB                       Relação  Opção
+//   episodio              documento de "episodios"      -        -
+//   internamento          internamento (subdocumento)   1:0..1   embedding
+//   observacao            observacoes (array)           1:N      embedding
+//   ato_clinico           atos (array)                  1:N      embedding
+//   anexo                 atos.anexos (array)           1:N      embedding
+//   pedido_laboratorial   pedidos (array)               1:N      embedding
+//   linha_pedido          pedidos.analises (array)      1:N      embedding
+//   resultado             pedidos.analises.resultado    1:0..1   embedding
+//   animal                animal                        N:1      referencing
+//   colaborador           *.colaborador, *.tecnico      N:1      referencing
+//   veterinario           pedidos.veterinario           N:1      referencing
+//   servico               atos.servico                  N:1      referencing
+//   analise               pedidos.analises              N:1      referencing
+//   marcacao              atos.id_marcacao              0..1:1   referencing
+//
+// Embedding nas relações 1:1 e 1:N em que a entidade relacionada só existe
+// dentro do episódio: é lida sempre com o episódio e tem o mesmo ciclo de vida.
+// Referencing para as entidades que existem por si só, partilhadas por muitos
+// episódios: embedding duplicaria os dados em cada episódio e obrigaria a
+// atualizar todas as cópias quando mudassem.
+//
+// Junto ao id de cada referência guarda-se uma cópia apenas dos atributos
+// usados pelas queries (ou que devem ficar congelados à data do registo):
 //   - animal {id_animal, nome, especie, id_cliente}
-//   - colaborador {nome}
-//   - servico {designacao}
-//   - analise {nome, unidade, valores de referência}
+//   - colaborador / tecnico {id_colaborador, nome}
+//   - veterinario {id_veterinario, nome}
+//   - servico {id_servico, designacao}
+//   - analise {id_analise, nome, unidade_medida, valores de referência}
+//   - marcacao: só o id
 //
-// Dados que mudam (telefone, email, morada, "ativo") não são copiados.
+// A cópia evita uma junção entre as duas bases de dados, por isso estes
+// atributos ficam duplicados. Dados que mudam (telefone, email, morada,
+// "ativo") não são copiados, por isso as cópias não ficam desatualizadas.
 //
 // Identificadores: o _id de cada episódio é o id_episodio do PostgreSQL (e os
 // subdocumentos mantêm os seus ids). Isto preserva a correspondência entre os
 // dois sistemas, usada na migração e nos testes de consistência.
 //
-// Obrigatoriedade: é required o que era NOT NULL no PostgreSQL.
-// Não são required os campos que aceitavam NULL nem as relações que podiam
-// ter zero elementos.
-// Os campos sem valor são omitidos (em vez de NULL como em SQL).
+// Obrigatoriedade: é required o que era NOT NULL no PostgreSQL; as relações
+// que podiam ter zero elementos não são required. Os campos sem valor são
+// omitidos (em vez de NULL).
 //
+// 3. ALTERNATIVAS NOSQL
+// -----------------------------------------------------------------------------
 // Alternativa NoSQL (não implementada): as observações registadas pelos
 // colaboradores ficam embedded no episódio, porque são poucas por episódio.
 // Se a clínica passasse a recolher os sinais vitais diretamente dos monitores
 // durante o internamento (temperatura, frequência cardíaca, frequência
 // respiratória a cada poucos segundos), esses dados seriam mais adequados a
-// uma base de dados time-series:
+// uma base de dados time-series (TSDB):
 //   - grande volume e escrita contínua (append-only), sem alterações nem
 //     eliminações;
 //   - consultas sempre por intervalo de tempo (ex.: média da temperatura de
@@ -59,17 +111,15 @@
 //     valores brutos durante 7 dias e as médias durante 1 ano).
 // Embedded no episódio, estas medições fariam crescer o documento sem limite.
 // O MongoDB também suporta time-series collections, que serviriam para um
-// volume moderado; uma base de dados time-series dedicada (InfluxDB, TimescaleDB) 
-// justifica-se pelas agregações contínuas e pela retenção por níveis 
-// (valores brutos -> médias), que o MongoDB não faz.
+// volume moderado; uma TSDB dedicada (InfluxDB, TimescaleDB) justifica-se
+// pelas agregações contínuas e pela retenção por níveis (valores brutos ->
+// médias), que o MongoDB não faz.
 
 db = db.getSiblingDB('clinica_vet');
 
 db.episodios.drop();
 
-// Referência a um colaborador (usada nas observações, nos atos e nos
-// resultados): id para o PostgreSQL e cópia do nome para identificar quem fez
-// o quê nos resultados das queries.
+// Referência a um colaborador (observações, atos e resultados).
 const refColaborador = {
 	bsonType: 'object',
 	required: ['id_colaborador', 'nome'],
@@ -119,8 +169,7 @@ db.createCollection('episodios', {
 						data_hora_fim: { bsonType: 'date' }, // ausente = sem alta
 					},
 				},
-				// Observações: só os valores medidos são guardados (em SQL, cada
-				// linha tem várias colunas a NULL). Mesmos limites dos CHECK.
+				// Observações: mesmos limites dos CHECK.
 				observacoes: {
 					bsonType: 'array',
 					items: {
